@@ -1,22 +1,18 @@
-
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.17;
 
 /*
-  EventBasedPredictionMarketSoundStake
-  - Adapted from UMA dev-quickstart EventBasedPredictionMarket
-  - Collateral = any ERC20 (pass EUROC address on Sepolia)
-  - On-chain commission (feeBps) forwarded to treasury
-  - Safer transfer flow: contract pulls total amount then pays fee to treasury
-  - Admin: Ownable (for treasury/fee updates), Pausable & ReentrancyGuard
-  - Constructor accepts a resolution timestamp so markets resolve after your chosen deadline
-  - Minimal rescue function for non-collateral tokens only
+  Clone-ready EventBasedPredictionMarketSoundStake
+  - Converted constructor -> initialize(...) so clones can be used.
+  - Uses OpenZeppelin upgradeable base patterns for initializer support.
+  - NOTE: Do NOT call initialize() on the implementation (template) contract itself.
 */
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import "@uma/core/contracts/common/implementation/ExpandedERC20.sol";
 import "@uma/core/contracts/common/implementation/Testable.sol";
@@ -27,9 +23,9 @@ import "@uma/core/contracts/oracle/interfaces/OptimisticOracleV2Interface.sol";
 import "@uma/core/contracts/oracle/interfaces/IdentifierWhitelistInterface.sol";
 import "@uma/core/contracts/oracle/interfaces/FinderInterface.sol";
 
-contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGuard, Pausable {
-    using SafeERC20 for IERC20;
-    using SafeERC20 for ExpandedERC20;
+contract EventBasedPredictionMarketSoundStakeUpgradeable is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
+    using SafeERC20Upgradeable for IERC20;
+    using SafeERC20Upgradeable for ExpandedERC20;
 
     // Market state
     bool public priceRequested;
@@ -40,7 +36,7 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
 
     // settlementPrice 0 .. 1e18 (UMA format)
     uint256 public settlementPrice;
-    bytes32 public priceIdentifier = "YES_OR_NO_QUERY";
+    bytes32 public priceIdentifier; // set in initialize
     int256 public expiryPrice;
 
     // Contracts / tokens
@@ -51,9 +47,9 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
 
     // Optimistic Oracle params (keep defaults but admin can tune)
     bytes public customAncillaryData;
-    uint256 public proposerReward = 0;               // default 0 (safe); can set >0
-    uint256 public optimisticOracleLivenessTime = 3600; // 1 hour default
-    uint256 public optimisticOracleProposerBond = 0;    // default 0 (safe)
+    uint256 public proposerReward;               // default 0 (safe); can set >0
+    uint256 public optimisticOracleLivenessTime; // liveness
+    uint256 public optimisticOracleProposerBond; // proposer bond
 
     // SoundStake fee config
     address public treasury;
@@ -80,40 +76,55 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
         _;
     }
 
-    /// @notice Constructor
+    /// @notice Initializer for clones
     /// @param _pairName human readable market name
-    /// @param _collateralToken EUROC or mock (ExpandedERC20)
+    /// @param _collateralToken EUROC or mock (address)
     /// @param _customAncillaryData bytes describing the question (must match proposer later)
     /// @param _finder UMA Finder address for this chain
     /// @param _timerAddress test timer (set to 0x0 in production)
     /// @param _resolutionTimestamp unix timestamp for resolution (e.g., now + 30 days)
     /// @param _treasury address receiving fees (Gnosis Safe recommended)
     /// @param _feeBps commission in bps (<= MAX_FEE_BPS)
-    constructor(
+    /// @param _owner owner (who will be the contract owner after initialize)
+    function initialize(
         string memory _pairName,
-        ExpandedERC20 _collateralToken,
+        address _collateralToken,
         bytes memory _customAncillaryData,
-        FinderInterface _finder,
+        address _finder,
         address _timerAddress,
         uint256 _resolutionTimestamp,
         address _treasury,
-        uint256 _feeBps
-    ) Testable(_timerAddress) {
+        uint256 _feeBps,
+        address _owner
+    ) external initializer {
         require(_treasury != address(0), "treasury 0");
         require(_feeBps <= MAX_FEE_BPS, "fee too high");
+        // init OZ upgradeable parents
+        __Ownable_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
 
-        finder = _finder;
-        collateralToken = _collateralToken;
+        // set state
+        finder = FinderInterface(_finder);
+        collateralToken = ExpandedERC20(_collateralToken);
         customAncillaryData = _customAncillaryData;
         pairName = _pairName;
 
-        // resolution timestamp: must be >= current time (you typically set this to 1 month later)
-        require(_resolutionTimestamp >= getCurrentTime(), "resolution in past");
+        // resolution timestamp
+        require(_resolutionTimestamp >= Testable(_timerAddress).getCurrentTime() || _timerAddress == address(0) || _resolutionTimestamp >= block.timestamp, "resolution in past");
         marketResolutionTimestamp = _resolutionTimestamp;
         requestTimestamp = _resolutionTimestamp; // use resolution timestamp as request id for OO
 
         treasury = _treasury;
         feeBps = _feeBps;
+
+        // defaults
+        proposerReward = 0;
+        optimisticOracleLivenessTime = 3600;
+        optimisticOracleProposerBond = 0;
+
+        // default identifier
+        priceIdentifier = bytes32("YES_OR_NO_QUERY");
 
         // Create long & short tokens with this contract as minter/burner
         longToken = new ExpandedERC20(string(abi.encodePacked(_pairName, " Long Token")), "PLT", 18);
@@ -123,6 +134,11 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
         shortToken.addMinter(address(this));
         longToken.addBurner(address(this));
         shortToken.addBurner(address(this));
+
+        // transfer ownership (if provided)
+        if (_owner != address(0)) {
+            transferOwnership(_owner);
+        }
     }
 
     /* ========== ADMIN FUNCTIONS (onlyOwner) ========== */
@@ -154,8 +170,6 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
 
     /* ========== MARKET LIFECYCLE ========== */
 
-    /// @notice Initialize the market by requesting the price from UMA OO.
-    /// Caller must have approved proposerReward (if > 0) to this contract.
     function initializeMarket() external whenNotPaused nonReentrant {
         // pull proposerReward if set (keeps OO incentives funded)
         if (proposerReward > 0) {
@@ -165,10 +179,9 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
         emit MarketInitialized(requestTimestamp, customAncillaryData);
     }
 
-    /// @notice Create long+short exposure by depositing collateral. The contract pulls the whole amount
-    /// and forwards the fee to the treasury; the net amount mints long & short tokens to the caller.
     function create(uint256 tokensToCreate) external whenNotPaused nonReentrant requestInitialized {
         require(tokensToCreate > 0, "zero amount");
+        require(getCurrentTime() < marketResolutionTimestamp, "market closed");
 
         // Pull full amount from user in a single ERC20 transfer (user must approve market for this amount)
         collateralToken.safeTransferFrom(msg.sender, address(this), tokensToCreate);
@@ -190,7 +203,6 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
         emit TokensCreated(msg.sender, tokensToCreate, net, fee);
     }
 
-    /// @notice Redeem an equal pair of long+short for 1:1 collateral (exit before settlement).
     function redeem(uint256 tokensToRedeem) external whenNotPaused nonReentrant {
         require(longToken.burnFrom(msg.sender, tokensToRedeem));
         require(shortToken.burnFrom(msg.sender, tokensToRedeem));
@@ -198,7 +210,6 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
         emit TokensRedeemed(msg.sender, tokensToRedeem, tokensToRedeem);
     }
 
-    /// @notice Settle after oracle resolved; users burn long/short and receive collateral according to settlementPrice.
     function settle(uint256 longTokensToRedeem, uint256 shortTokensToRedeem) external whenNotPaused nonReentrant returns (uint256 collateralReturned) {
         require(receivedSettlementPrice, "not resolved");
         require(longToken.burnFrom(msg.sender, longTokensToRedeem));
@@ -258,7 +269,7 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
             priceIdentifier,
             requestTimestamp,
             customAncillaryData,
-            collateralToken,
+            IERC20(address(collateralToken)),
             proposerReward
         );
 
@@ -280,5 +291,11 @@ contract EventBasedPredictionMarketSoundStake is Testable, Ownable, ReentrancyGu
 
     function _getAddressWhitelist() internal view returns (AddressWhitelist) {
         return AddressWhitelist(finder.getImplementationAddress(OracleInterfaces.CollateralWhitelist));
+    }
+
+    // helper to get current time (wrap Testable if needed)
+    function getCurrentTime() public view returns (uint256) {
+        // If finder/timer pattern required, we fallback to block.timestamp
+        return block.timestamp;
     }
 }
