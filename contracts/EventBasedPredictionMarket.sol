@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.0;
 
-/*
-  Clone-ready EventBasedPredictionMarketSoundStake
-  - Converted constructor -> initialize(...) so clones can be used.
-  - Uses OpenZeppelin upgradeable base patterns for initializer support.
-  - NOTE: Do NOT call initialize() on the implementation (template) contract itself.
-*/
-
-import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import "@uma/core/contracts/common/implementation/ExpandedERC20.sol";
 import "@uma/core/contracts/common/implementation/Testable.sol";
@@ -21,53 +10,72 @@ import "@uma/core/contracts/oracle/implementation/Constants.sol";
 
 import "@uma/core/contracts/oracle/interfaces/OptimisticOracleV2Interface.sol";
 import "@uma/core/contracts/oracle/interfaces/IdentifierWhitelistInterface.sol";
-import "@uma/core/contracts/oracle/interfaces/FinderInterface.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract EventBasedPredictionMarketSoundStakeUpgradeable is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
-    using SafeERC20Upgradeable for IERC20;
-    using SafeERC20Upgradeable for ExpandedERC20;
+contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
+    using SafeERC20 for ExpandedERC20;
 
-    // Market state
+    /***************************************************
+     *  EVENT BASED PREDICTION MARKET DATA STRUCTURES  *
+     ***************************************************/
     bool public priceRequested;
     bool public receivedSettlementPrice;
-    uint256 public requestTimestamp; // used to identify this price request to the OO
-    uint256 public marketResolutionTimestamp; // human-friendly deadline you pass in (unix)
+
+    uint256 public requestTimestamp;
     string public pairName;
 
-    // settlementPrice 0 .. 1e18 (UMA format)
+    // Number between 0 and 1e18 to allocate collateral between long & short tokens at redemption. 0 entitles each short
+    // to 1e18 and each long to 0. 1e18 makes each long worth 1e18 and short 0.
     uint256 public settlementPrice;
-    bytes32 public priceIdentifier; // set in initialize
+
+    bytes32 public priceIdentifier = "YES_OR_NO_QUERY";
+
+    // Price returned from the Optimistic oracle at settlement time.
     int256 public expiryPrice;
 
-    // Contracts / tokens
-    ExpandedERC20 public collateralToken;     // EUROC on Sepolia (or mock)
-    ExpandedERC20 public longToken;
-    ExpandedERC20 public shortToken;
+    // External contract interfaces.
+    ExpandedERC20 public collateralToken;
+    ExpandedIERC20 public longToken;
+    ExpandedIERC20 public shortToken;
     FinderInterface public finder;
 
-    // Optimistic Oracle params (keep defaults but admin can tune)
+    // Optimistic oracle customization parameters.
     bytes public customAncillaryData;
-    uint256 public proposerReward;               // default 0 (safe); can set >0
-    uint256 public optimisticOracleLivenessTime; // liveness
-    uint256 public optimisticOracleProposerBond; // proposer bond
+    uint256 public proposerReward = 10e18;
+    uint256 public optimisticOracleLivenessTime = 3600; // 1 hour
+    uint256 public optimisticOracleProposerBond = 500e18;
 
-    // SoundStake fee config
+    uint256 public feeBps; // basis points (parts per 10k)
     address public treasury;
-    uint256 public feeBps; // basis points; 100 bps = 1%
 
-    // Limits
-    uint256 public constant MAX_FEE_BPS = 1000; // safety: <= 10%
+    /****************************************
+     *                EVENTS                *
+     ****************************************/
 
-    // Events
-    event MarketInitialized(uint256 requestTimestamp, bytes ancillaryData);
-    event TokensCreated(address indexed sponsor, uint256 collateralIn, uint256 netMinted, uint256 feeTaken);
-    event TokensRedeemed(address indexed sponsor, uint256 collateralOut, uint256 tokensRedeemed);
+
+
+     event FeeCollected(address indexed payer, uint256 amount);
+    // --- admin setters ---
+    function setFeeBps(uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= 1000, "fee too high"); // <=10%
+        feeBps = _feeBps;
+    }
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "zero treasury");
+        treasury = _treasury;
+    }
+
+    event TokensCreated(address indexed sponsor, uint256 indexed collateralUsed, uint256 indexed tokensMinted);
+    event TokensRedeemed(address indexed sponsor, uint256 indexed collateralReturned, uint256 indexed tokensRedeemed);
     event PositionSettled(address indexed sponsor, uint256 collateralReturned, uint256 longTokens, uint256 shortTokens);
-    event FeeUpdated(uint256 oldBps, uint256 newBps);
-    event TreasuryUpdated(address oldTreasury, address newTreasury);
+
+    /****************************************
+     *               MODIFIERS              *
+     ****************************************/
 
     modifier hasPrice() {
-        require(getOptimisticOracle().hasPrice(address(this), priceIdentifier, requestTimestamp, customAncillaryData), "no price");
+        require(getOptimisticOracle().hasPrice(address(this), priceIdentifier, requestTimestamp, customAncillaryData));
         _;
     }
 
@@ -76,145 +84,171 @@ contract EventBasedPredictionMarketSoundStakeUpgradeable is Initializable, Ownab
         _;
     }
 
-    /// @notice Initializer for clones
-    /// @param _pairName human readable market name
-    /// @param _collateralToken EUROC or mock (address)
-    /// @param _customAncillaryData bytes describing the question (must match proposer later)
-    /// @param _finder UMA Finder address for this chain
-    /// @param _timerAddress test timer (set to 0x0 in production)
-    /// @param _resolutionTimestamp unix timestamp for resolution (e.g., now + 30 days)
-    /// @param _treasury address receiving fees (Gnosis Safe recommended)
-    /// @param _feeBps commission in bps (<= MAX_FEE_BPS)
-    /// @param _owner owner (who will be the contract owner after initialize)
-    function initialize(
+    /**
+     * @notice Construct the EventBasedPredictionMarket
+     * @param _pairName: Name of the long short pair tokens created for the prediction market.
+     * @param _collateralToken: Collateral token used to back LSP synthetics.
+     * @param _customAncillaryData: Custom ancillary data to be passed along with the price request to the OO.
+     * @param _finder: DVM finder to find other UMA ecosystem contracts.
+     * @param _timerAddress: Timer used to synchronize contract time in testing. Set to 0x000... in production.
+     */
+    constructor(
         string memory _pairName,
-        address _collateralToken,
+        ExpandedERC20 _collateralToken,
         bytes memory _customAncillaryData,
-        address _finder,
-        address _timerAddress,
-        uint256 _resolutionTimestamp,
-        address _treasury,
-        uint256 _feeBps,
-        address _owner
-    ) external initializer {
-        require(_treasury != address(0), "treasury 0");
-        require(_feeBps <= MAX_FEE_BPS, "fee too high");
-        // init OZ upgradeable parents
-        __Ownable_init();
-        __ReentrancyGuard_init();
-        __Pausable_init();
+        FinderInterface _finder,
+        address _timerAddress
+    ) Testable(_timerAddress) {
+        finder = _finder;
 
-        // set state
-        finder = FinderInterface(_finder);
-        collateralToken = ExpandedERC20(_collateralToken);
+        require(_getIdentifierWhitelist().isIdentifierSupported(priceIdentifier), "Identifier not registered");
+        require(_getAddressWhitelist().isOnWhitelist(address(_collateralToken)), "Unsupported collateral type");
+
+        collateralToken = _collateralToken;
         customAncillaryData = _customAncillaryData;
         pairName = _pairName;
 
-        // resolution timestamp
-        require(_resolutionTimestamp >= Testable(_timerAddress).getCurrentTime() || _timerAddress == address(0) || _resolutionTimestamp >= block.timestamp, "resolution in past");
-        marketResolutionTimestamp = _resolutionTimestamp;
-        requestTimestamp = _resolutionTimestamp; // use resolution timestamp as request id for OO
-
-        treasury = _treasury;
-        feeBps = _feeBps;
-
-        // defaults
-        proposerReward = 0;
-        optimisticOracleLivenessTime = 3600;
-        optimisticOracleProposerBond = 0;
-
-        // default identifier
-        priceIdentifier = bytes32("YES_OR_NO_QUERY");
-
-        // Create long & short tokens with this contract as minter/burner
+        requestTimestamp = getCurrentTime(); // Set the request timestamp to the current block timestamp.
+        // Holding long tokens gives the owner exposure to the long position,
+        // i.e. the case where the answer to the prediction market question is YES.
         longToken = new ExpandedERC20(string(abi.encodePacked(_pairName, " Long Token")), "PLT", 18);
+        // Holding short tokens gives the owner exposure to the short position,
+        // i.e. the case where the answer to the prediction market question is NO.
         shortToken = new ExpandedERC20(string(abi.encodePacked(_pairName, " Short Token")), "PST", 18);
 
+        // Add burner and minter required roles to the long and short tokens.
         longToken.addMinter(address(this));
         shortToken.addMinter(address(this));
         longToken.addBurner(address(this));
         shortToken.addBurner(address(this));
-
-        // transfer ownership (if provided)
-        if (_owner != address(0)) {
-            transferOwnership(_owner);
-        }
     }
 
-    /* ========== ADMIN FUNCTIONS (onlyOwner) ========== */
-
-    function setFeeBps(uint256 _feeBps) external onlyOwner {
-        require(_feeBps <= MAX_FEE_BPS, "fee cap");
-        emit FeeUpdated(feeBps, _feeBps);
-        feeBps = _feeBps;
-    }
-
-    function setTreasury(address _treasury) external onlyOwner {
-        require(_treasury != address(0), "treasury 0");
-        emit TreasuryUpdated(treasury, _treasury);
-        treasury = _treasury;
-    }
-
-    function setProposerReward(uint256 _reward) external onlyOwner { proposerReward = _reward; }
-    function setLiveness(uint256 _secs) external onlyOwner { optimisticOracleLivenessTime = _secs; }
-    function setProposerBond(uint256 _bond) external onlyOwner { optimisticOracleProposerBond = _bond; }
-
-    function pauseMarket() external onlyOwner { _pause(); }
-    function unpauseMarket() external onlyOwner { _unpause(); }
-
-    /// @notice Rescue ERC20 tokens accidentally sent to this contract, but never allow rescue of the collateral token.
-    function rescueToken(address token, uint256 amount, address to) external onlyOwner {
-        require(token != address(collateralToken), "cannot rescue collateral");
-        IERC20(token).safeTransfer(to, amount);
-    }
-
-    /* ========== MARKET LIFECYCLE ========== */
-
-    function initializeMarket() external whenNotPaused nonReentrant {
-        // pull proposerReward if set (keeps OO incentives funded)
+    /**
+     * @notice Initialize the market by requesting the price from the optimistic oracle.
+     * The caller must have sufficient balance to pay the proposer reward and approve the contract to spend the collateral.
+     */
+    function initializeMarket() public {
+        // If the proposer reward was set then pull it from the caller of the function.
         if (proposerReward > 0) {
             collateralToken.safeTransferFrom(msg.sender, address(this), proposerReward);
         }
         _requestOraclePrice();
-        emit MarketInitialized(requestTimestamp, customAncillaryData);
     }
 
-    function create(uint256 tokensToCreate) external whenNotPaused nonReentrant requestInitialized {
-        require(tokensToCreate > 0, "zero amount");
-        require(getCurrentTime() < marketResolutionTimestamp, "market closed");
+    /**
+     * @notice Callback function called by the optimistic oracle when a price requested by this contract is settled.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     * @param price price that was resolved by the escalation process.
+     */
+    function priceSettled(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        int256 price
+    ) external {
+        OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
+        require(msg.sender == address(optimisticOracle), "not authorized");
 
-        // Pull full amount from user in a single ERC20 transfer (user must approve market for this amount)
-        collateralToken.safeTransferFrom(msg.sender, address(this), tokensToCreate);
+        require(identifier == priceIdentifier, "same identifier");
+        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "same ancillary data");
 
-        // Compute fee & net
-        uint256 fee = (tokensToCreate * feeBps) / 10000;
-        uint256 net = tokensToCreate - fee;
-        require(net > 0, "net zero after fee");
+        // We only want to process the price if it is for the current price request.
+        if (timestamp != requestTimestamp) return;
 
-        // Forward fee to treasury (immediate, on-chain)
-        if (fee > 0) {
-            collateralToken.safeTransfer(treasury, fee);
+        // Calculate the value of settlementPrice using either 0, 0.5e18, or 1e18 as the expiryPrice.
+        if (price >= 1e18) {
+            settlementPrice = 1e18;
+        } else if (price == 5e17) {
+            settlementPrice = 5e17;
+        } else {
+            settlementPrice = 0;
         }
 
-        // Mint net long & short tokens for user
-        require(longToken.mint(msg.sender, net));
-        require(shortToken.mint(msg.sender, net));
-
-        emit TokensCreated(msg.sender, tokensToCreate, net, fee);
+        receivedSettlementPrice = true;
     }
 
-    function redeem(uint256 tokensToRedeem) external whenNotPaused nonReentrant {
+    /**
+     * @notice Callback function called by the optimistic oracle when a price requested by this contract is disputed.
+     * @param identifier The identifier of the price request.
+     * @param timestamp The timestamp of the price request.
+     * @param ancillaryData Custom ancillary data to be passed along with the price request to the OO.
+     * @param refund The amount of collateral refunded to the caller of the price request.
+     */
+    function priceDisputed(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        uint256 refund
+    ) external {
+        OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
+        require(msg.sender == address(optimisticOracle), "not authorized");
+
+        require(timestamp == requestTimestamp, "different timestamps");
+        require(identifier == priceIdentifier, "same identifier");
+        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "same ancillary data");
+        require(refund == proposerReward, "same proposerReward amount");
+
+        requestTimestamp = getCurrentTime();
+        _requestOraclePrice();
+    }
+
+    /****************************************
+     *          POSITION FUNCTIONS          *
+     ****************************************/
+
+    /**
+     * @notice Creates a pair of long and short tokens equal in number to tokensToCreate. Pulls the required collateral.
+     * @param tokensToCreate number of long and short synthetic tokens to create.
+     */
+    function create(uint256 tokensToCreate) public requestInitialized nonReentrant {
+        require(treasury != address(0), "treasury not set");
+        uint256 fee = (tokensToCreate * feeBps) / 10000; // example: feeBps = 50 -> 0.5%
+        // Caller must approve this contract for tokensToCreate + fee
+        collateralToken.safeTransferFrom(msg.sender, address(this), tokensToCreate);
+        if (fee > 0) {
+            collateralToken.safeTransferFrom(msg.sender, treasury, fee);
+            emit FeeCollected(msg.sender, fee);
+        }
+
+        require(longToken.mint(msg.sender, tokensToCreate));
+        require(shortToken.mint(msg.sender, tokensToCreate));
+
+        emit TokensCreated(msg.sender, tokensToCreate, tokensToCreate);
+    }
+
+    /**
+     * @notice Redeems a pair of long and short tokens equal in number to tokensToRedeem.
+     * Returns the corresponding collateral amount in a 1 to 1 ratio.
+     * @param tokensToRedeem number of long and short synthetic tokens to redeem.
+     */
+    function redeem(uint256 tokensToRedeem) public {
         require(longToken.burnFrom(msg.sender, tokensToRedeem));
         require(shortToken.burnFrom(msg.sender, tokensToRedeem));
+
         collateralToken.safeTransfer(msg.sender, tokensToRedeem);
+
         emit TokensRedeemed(msg.sender, tokensToRedeem, tokensToRedeem);
     }
 
-    function settle(uint256 longTokensToRedeem, uint256 shortTokensToRedeem) external whenNotPaused nonReentrant returns (uint256 collateralReturned) {
-        require(receivedSettlementPrice, "not resolved");
+    /**
+     * @notice Settle long and/or short tokens in for collateral at a rate informed by the contract settlement.
+     * @param longTokensToRedeem number of long tokens to settle.
+     * @param shortTokensToRedeem number of short tokens to settle.
+     * @return collateralReturned total collateral returned in exchange for the pair of synthetics.
+     */
+    function settle(uint256 longTokensToRedeem, uint256 shortTokensToRedeem)
+        public
+        returns (uint256 collateralReturned)
+    {
+        require(receivedSettlementPrice, "price not yet resolved");
+
         require(longToken.burnFrom(msg.sender, longTokensToRedeem));
         require(shortToken.burnFrom(msg.sender, shortTokensToRedeem));
 
+        // settlementPrice is a number between 0 and 1e18. 0 means all collateral goes to short tokens and 1e18 means
+        // all collateral goes to the long token. Total collateral returned is the sum of payouts.
         uint256 longCollateralRedeemed = (longTokensToRedeem * settlementPrice) / (1e18);
         uint256 shortCollateralRedeemed = (shortTokensToRedeem * (1e18 - settlementPrice)) / (1e18);
 
@@ -224,78 +258,68 @@ contract EventBasedPredictionMarketSoundStakeUpgradeable is Initializable, Ownab
         emit PositionSettled(msg.sender, collateralReturned, longTokensToRedeem, shortTokensToRedeem);
     }
 
-    /* ========== UMA CALLBACKS & HELPERS ========== */
+    /****************************************
+     *          INTERNAL FUNCTIONS          *
+     ****************************************/
 
-    function priceSettled(bytes32 identifier, uint256 timestamp, bytes memory ancillaryData, int256 price) external {
-        OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
-        require(msg.sender == address(optimisticOracle), "not authorized");
-        require(identifier == priceIdentifier, "identifier mismatch");
-        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "ancillary mismatch");
-        if (timestamp != requestTimestamp) return; // different request (ignore)
-
-        // Map price to 0, 0.5, 1 e18 as UMA examples do
-        if (price >= 1e18) {
-            settlementPrice = 1e18;
-        } else if (price == 5e17) {
-            settlementPrice = 5e17;
-        } else {
-            settlementPrice = 0;
-        }
-        receivedSettlementPrice = true;
-    }
-
-    function priceDisputed(bytes32 identifier, uint256 timestamp, bytes memory ancillaryData, uint256 refund) external {
-        OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
-        require(msg.sender == address(optimisticOracle), "not authorized");
-        require(timestamp == requestTimestamp, "timestamp mismatch");
-        require(identifier == priceIdentifier, "identifier mismatch");
-        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "ancillary mismatch");
-        require(refund == proposerReward, "refund mismatch");
-
-        // On dispute we re-create a new request timestamp (simple retry pattern)
-        requestTimestamp = getCurrentTime();
-        _requestOraclePrice();
-    }
-
+    /**
+     * @notice Request a price in the optimistic oracle for a given request timestamp and ancillary data combo. Set the bonds
+     * accordingly to the deployer's parameters. Will revert if re-requesting for a previously requested combo.
+     */
     function _requestOraclePrice() internal {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
 
-        // Approve proposerReward for OO
-        if (proposerReward > 0) {
-            collateralToken.safeApprove(address(optimisticOracle), proposerReward);
-        }
+        collateralToken.safeApprove(address(optimisticOracle), proposerReward);
 
         optimisticOracle.requestPrice(
             priceIdentifier,
             requestTimestamp,
             customAncillaryData,
-            IERC20(address(collateralToken)),
+            collateralToken,
             proposerReward
         );
 
-        optimisticOracle.setCustomLiveness(priceIdentifier, requestTimestamp, customAncillaryData, optimisticOracleLivenessTime);
+        // Set the Optimistic oracle liveness for the price request.
+        optimisticOracle.setCustomLiveness(
+            priceIdentifier,
+            requestTimestamp,
+            customAncillaryData,
+            optimisticOracleLivenessTime
+        );
+
+        // Set the Optimistic oracle proposer bond for the price request.
         optimisticOracle.setBond(priceIdentifier, requestTimestamp, customAncillaryData, optimisticOracleProposerBond);
+
+        // Make the request an event-based request.
         optimisticOracle.setEventBased(priceIdentifier, requestTimestamp, customAncillaryData);
+
+        // Enable the priceDisputed and priceSettled callback
         optimisticOracle.setCallbacks(priceIdentifier, requestTimestamp, customAncillaryData, false, true, true);
 
         priceRequested = true;
     }
 
+    /**
+     * @notice Get the optimistic oracle.
+     * @return optimistic oracle instance.
+     */
     function getOptimisticOracle() internal view returns (OptimisticOracleV2Interface) {
-        return OptimisticOracleV2Interface(finder.getImplementationAddress(OracleInterfaces.OptimisticOracleV2));
+        return OptimisticOracleV2Interface(finder.getImplementationAddress("OptimisticOracleV2")); // TODO OracleInterfaces.OptimisticOracleV2
     }
 
+    /**
+     * @notice Get the identifier white list.
+     * @return identifier whitelist instance.
+     */
     function _getIdentifierWhitelist() internal view returns (IdentifierWhitelistInterface) {
         return IdentifierWhitelistInterface(finder.getImplementationAddress(OracleInterfaces.IdentifierWhitelist));
     }
 
+    /**
+     * @notice Get the address whitelist
+     * @return address whitelist instance.
+     */
     function _getAddressWhitelist() internal view returns (AddressWhitelist) {
         return AddressWhitelist(finder.getImplementationAddress(OracleInterfaces.CollateralWhitelist));
-    }
-
-    // helper to get current time (wrap Testable if needed)
-    function getCurrentTime() public view returns (uint256) {
-        // If finder/timer pattern required, we fallback to block.timestamp
-        return block.timestamp;
     }
 }
