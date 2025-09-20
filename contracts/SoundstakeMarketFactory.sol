@@ -1,68 +1,42 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.17;
 
-import "@openzeppelin/contracts/proxy/Clones.sol";
+import "./EventBasedPredictionMarket.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-interface IEventMarket {
-    function initialize(
+contract MarketFactory is Ownable {
+    address[] public markets;
+    event MarketCreated(address indexed market, address indexed creator, string pairName);
+
+    /// @notice Create a new EventBasedPredictionMarket
+    /// @param _pairName readable name for market
+    /// @param _collateralToken address of collateral ERC20 (pass address, cast inside)
+    /// @param _customAncillaryData the question bytes
+    /// @param _finder address of UMA Finder on the network
+    /// @param _timerAddress usually address(0) in production
+    function createMarket(
         string calldata _pairName,
         address _collateralToken,
         bytes calldata _customAncillaryData,
         address _finder,
-        address _timerAddress,
-        uint256 _resolutionTimestamp,
-        address _treasury,
-        uint256 _feeBps,
-        address _owner
-    ) external;
-}
-
-contract SoundStakeMarketFactory {
-    using Clones for address;
-
-    address public immutable implementation; // template
-    address[] public allMarkets;
-    event MarketCreated(address indexed market, address indexed creator, string pairName, uint256 resolutionTimestamp);
-
-    constructor(address _implementation) {
-        require(_implementation != address(0), "impl 0");
-        implementation = _implementation;
-    }
-
-    /// @notice Create a new market clone and initialize it
-    function createMarket(
-        string calldata pairName,
-        address collateralToken,
-        bytes calldata ancillaryData,
-        address finder,
-        address timerAddress,
-        uint256 resolutionTimestamp,
-        address treasury,
-        uint256 feeBps,
-        address owner
+        address _timerAddress
     ) external returns (address) {
-        address clone = implementation.clone();
-        IEventMarket(clone).initialize(
-            pairName,
-            collateralToken,
-            ancillaryData,
-            finder,
-            timerAddress,
-            resolutionTimestamp,
-            treasury,
-            feeBps,
-            owner
+        EventBasedPredictionMarket m = new EventBasedPredictionMarket(
+            _pairName,
+            ExpandedERC20(_collateralToken),
+            _customAncillaryData,
+            FinderInterface(_finder),
+            _timerAddress
         );
-        allMarkets.push(clone);
-        emit MarketCreated(clone, msg.sender, pairName, resolutionTimestamp);
-        return clone;
+        // transfer Owner to caller so admin controls market (optional)
+        m.transferOwnership(msg.sender);
+        markets.push(address(m));
+        emit MarketCreated(address(m), msg.sender, _pairName);
+        return address(m);
     }
 
-    function marketsCount() external view returns (uint256) {
-        return allMarkets.length;
-    }
-
-    function getAllMarkets() external view returns (address[] memory) {
-        return allMarkets;
+    function getMarkets() external view returns (address[] memory) {
+        return markets;
     }
 }
+
