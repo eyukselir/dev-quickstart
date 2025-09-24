@@ -2,96 +2,76 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-
 import "@uma/core/contracts/common/implementation/ExpandedERC20.sol";
 import "@uma/core/contracts/common/implementation/Testable.sol";
 import "@uma/core/contracts/common/implementation/AddressWhitelist.sol";
 import "@uma/core/contracts/oracle/implementation/Constants.sol";
-
 import "@uma/core/contracts/oracle/interfaces/OptimisticOracleV2Interface.sol";
 import "@uma/core/contracts/oracle/interfaces/IdentifierWhitelistInterface.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
+contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for ExpandedERC20;
 
-    /***************************************************
-     *  EVENT BASED PREDICTION MARKET DATA STRUCTURES  *
-     ***************************************************/
+    // --- Oracle / market state ---
     bool public priceRequested;
     bool public receivedSettlementPrice;
-
     uint256 public requestTimestamp;
     string public pairName;
 
-    // Number between 0 and 1e18 to allocate collateral between long & short tokens at redemption. 0 entitles each short
-    // to 1e18 and each long to 0. 1e18 makes each long worth 1e18 and short 0.
+    // settlementPrice encoding: 0 => NO, 0.5e18 => TIE, 1e18 => YES
     uint256 public settlementPrice;
-
     bytes32 public priceIdentifier = "YES_OR_NO_QUERY";
+    bytes public customAncillaryData;
 
-    // Price returned from the Optimistic oracle at settlement time.
-    int256 public expiryPrice;
-
-    // External contract interfaces.
+    // Tokens / external
     ExpandedERC20 public collateralToken;
-    ExpandedIERC20 public longToken;
-    ExpandedIERC20 public shortToken;
     FinderInterface public finder;
 
-    // Optimistic oracle customization parameters.
-    bytes public customAncillaryData;
+    // UMA params (defaults can be changed by owner)
     uint256 public proposerReward = 10e18;
-    uint256 public optimisticOracleLivenessTime = 3600; // 1 hour
+    uint256 public optimisticOracleLivenessTime = 3600;
     uint256 public optimisticOracleProposerBond = 500e18;
 
-    uint256 public feeBps; // basis points (parts per 10k)
+    // SoundStake params
+    uint256 public feeBps; // basis points
     address public treasury;
 
-    /****************************************
-     *                EVENTS                *
-     ****************************************/
+    // Betting pools
+    uint256 public totalYes;
+    uint256 public totalNo;
 
+    // Per-user accounting
+    mapping(address => uint256) public betsYes;
+    mapping(address => uint256) public betsNo;
+    mapping(address => bool) public claimed;
 
+    // Betting window (lock)
+    uint256 public bettingWindowEnd; // timestamp after which betting is closed
+    bool public marketInitialized;
 
-     event FeeCollected(address indexed payer, uint256 amount);
-    // --- admin setters ---
-    function setFeeBps(uint256 _feeBps) external onlyOwner {
-        require(_feeBps <= 1000, "fee too high"); // <=10%
-        feeBps = _feeBps;
-    }
-    function setTreasury(address _treasury) external onlyOwner {
-        require(_treasury != address(0), "zero treasury");
-        treasury = _treasury;
-    }
+    // Events
+    event MarketInitialized(uint256 requestTimestamp, uint256 bettingWindowEnd);
+    event BetPlaced(address indexed user, bool indexed isYes, uint256 amount);
+    event FeeCollected(address indexed payer, uint256 amount);
+    event PriceRequested(bytes32 identifier, uint256 timestamp);
+    event PriceSettled(uint256 settlementPrice);
+    event WinningsClaimed(address indexed user, uint256 amount);
+    event TreasurySwept(uint256 amount);
 
-    event TokensCreated(address indexed sponsor, uint256 indexed collateralUsed, uint256 indexed tokensMinted);
-    event TokensRedeemed(address indexed sponsor, uint256 indexed collateralReturned, uint256 indexed tokensRedeemed);
-    event PositionSettled(address indexed sponsor, uint256 collateralReturned, uint256 longTokens, uint256 shortTokens);
-
-    /****************************************
-     *               MODIFIERS              *
-     ****************************************/
-
-    modifier hasPrice() {
-        require(getOptimisticOracle().hasPrice(address(this), priceIdentifier, requestTimestamp, customAncillaryData));
+    modifier onlyWhenBettingOpen() {
+        require(marketInitialized, "market not initialized");
+        require(block.timestamp <= bettingWindowEnd, "betting closed");
         _;
     }
 
-    modifier requestInitialized() {
-        require(priceRequested, "Price not requested");
+    modifier onlyAfterSettlement() {
+        require(receivedSettlementPrice, "not settled yet");
         _;
     }
 
-    /**
-     * @notice Construct the EventBasedPredictionMarket
-     * @param _pairName: Name of the long short pair tokens created for the prediction market.
-     * @param _collateralToken: Collateral token used to back LSP synthetics.
-     * @param _customAncillaryData: Custom ancillary data to be passed along with the price request to the OO.
-     * @param _finder: DVM finder to find other UMA ecosystem contracts.
-     * @param _timerAddress: Timer used to synchronize contract time in testing. Set to 0x000... in production.
-     */
     constructor(
         string memory _pairName,
         ExpandedERC20 _collateralToken,
@@ -104,43 +84,97 @@ contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
         require(_getIdentifierWhitelist().isIdentifierSupported(priceIdentifier), "Identifier not registered");
         require(_getAddressWhitelist().isOnWhitelist(address(_collateralToken)), "Unsupported collateral type");
 
+        pairName = _pairName;
         collateralToken = _collateralToken;
         customAncillaryData = _customAncillaryData;
-        pairName = _pairName;
+    }
 
-        requestTimestamp = getCurrentTime(); // Set the request timestamp to the current block timestamp.
-        // Holding long tokens gives the owner exposure to the long position,
-        // i.e. the case where the answer to the prediction market question is YES.
-        longToken = new ExpandedERC20(string(abi.encodePacked(_pairName, " Long Token")), "PLT", 18);
-        // Holding short tokens gives the owner exposure to the short position,
-        // i.e. the case where the answer to the prediction market question is NO.
-        shortToken = new ExpandedERC20(string(abi.encodePacked(_pairName, " Short Token")), "PST", 18);
+    // --- Admin setters ---
+    function setFeeBps(uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= 1000, "fee too high"); // max 10%
+        feeBps = _feeBps;
+    }
 
-        // Add burner and minter required roles to the long and short tokens.
-        longToken.addMinter(address(this));
-        shortToken.addMinter(address(this));
-        longToken.addBurner(address(this));
-        shortToken.addBurner(address(this));
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "zero treasury");
+        treasury = _treasury;
+    }
+
+    function setProposerReward(uint256 _r) external onlyOwner {
+        proposerReward = _r;
+    }
+
+    function setOptimisticParams(uint256 _liveness, uint256 _bond) external onlyOwner {
+        optimisticOracleLivenessTime = _liveness;
+        optimisticOracleProposerBond = _bond;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /**
-     * @notice Initialize the market by requesting the price from the optimistic oracle.
-     * The caller must have sufficient balance to pay the proposer reward and approve the contract to spend the collateral.
+     * @notice Initialize market: request price from OO and open betting window for `bettingWindowSeconds`.
+     * Caller must fund proposerReward (if >0).
      */
-    function initializeMarket() public {
-        // If the proposer reward was set then pull it from the caller of the function.
+    function initializeMarket(uint256 bettingWindowSeconds) external whenNotPaused {
+        require(!marketInitialized, "already initialized");
+
+        // fund proposerReward
         if (proposerReward > 0) {
             collateralToken.safeTransferFrom(msg.sender, address(this), proposerReward);
         }
+
+        requestTimestamp = getCurrentTime();
         _requestOraclePrice();
+
+        bettingWindowEnd = block.timestamp + bettingWindowSeconds;
+        marketInitialized = true;
+
+        emit MarketInitialized(requestTimestamp, bettingWindowEnd);
     }
 
     /**
-     * @notice Callback function called by the optimistic oracle when a price requested by this contract is settled.
-     * @param identifier price identifier being requested.
-     * @param timestamp timestamp of the price being requested.
-     * @param ancillaryData ancillary data of the price being requested.
-     * @param price price that was resolved by the escalation process.
+     * @notice place a YES bet
+     */
+    function betYes(uint256 amount) external whenNotPaused onlyWhenBettingOpen nonReentrant {
+        require(amount > 0, "amount=0");
+        _collectStake(msg.sender, amount);
+        betsYes[msg.sender] += amount;
+        totalYes += amount;
+        emit BetPlaced(msg.sender, true, amount);
+    }
+
+    /**
+     * @notice place a NO bet
+     */
+    function betNo(uint256 amount) external whenNotPaused onlyWhenBettingOpen nonReentrant {
+        require(amount > 0, "amount=0");
+        _collectStake(msg.sender, amount);
+        betsNo[msg.sender] += amount;
+        totalNo += amount;
+        emit BetPlaced(msg.sender, false, amount);
+    }
+
+    // internal helper to pull stake and fee
+    function _collectStake(address from, uint256 amount) internal {
+        uint256 fee = (amount * feeBps) / 10000;
+        uint256 net = amount;
+        if (fee > 0) {
+            net = amount - fee;
+            collateralToken.safeTransferFrom(from, treasury, fee);
+            emit FeeCollected(from, fee);
+        }
+        // transfer net amount to contract (note: require approval)
+        collateralToken.safeTransferFrom(from, address(this), net);
+    }
+
+    /**
+     * @notice Oracle callback when price is settled
      */
     function priceSettled(
         bytes32 identifier,
@@ -150,31 +184,24 @@ contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
     ) external {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
         require(msg.sender == address(optimisticOracle), "not authorized");
-
-        require(identifier == priceIdentifier, "same identifier");
-        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "same ancillary data");
-
-        // We only want to process the price if it is for the current price request.
+        require(identifier == priceIdentifier, "identifier mismatch");
+        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "ancillary mismatch");
         if (timestamp != requestTimestamp) return;
 
-        // Calculate the value of settlementPrice using either 0, 0.5e18, or 1e18 as the expiryPrice.
         if (price >= 1e18) {
-            settlementPrice = 1e18;
+            settlementPrice = 1e18; // YES
         } else if (price == 5e17) {
-            settlementPrice = 5e17;
+            settlementPrice = 5e17; // TIE
         } else {
-            settlementPrice = 0;
+            settlementPrice = 0; // NO
         }
 
         receivedSettlementPrice = true;
+        emit PriceSettled(settlementPrice);
     }
 
     /**
-     * @notice Callback function called by the optimistic oracle when a price requested by this contract is disputed.
-     * @param identifier The identifier of the price request.
-     * @param timestamp The timestamp of the price request.
-     * @param ancillaryData Custom ancillary data to be passed along with the price request to the OO.
-     * @param refund The amount of collateral refunded to the caller of the price request.
+     * @notice Oracle callback when price disputed (we re-request)
      */
     function priceDisputed(
         bytes32 identifier,
@@ -184,88 +211,83 @@ contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
     ) external {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
         require(msg.sender == address(optimisticOracle), "not authorized");
-
         require(timestamp == requestTimestamp, "different timestamps");
-        require(identifier == priceIdentifier, "same identifier");
-        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "same ancillary data");
-        require(refund == proposerReward, "same proposerReward amount");
+        require(identifier == priceIdentifier, "identifier mismatch");
+        require(keccak256(ancillaryData) == keccak256(customAncillaryData), "ancillary mismatch");
+        require(refund == proposerReward, "proposerReward mismatch");
 
+        // bump the request timestamp and re-request
         requestTimestamp = getCurrentTime();
         _requestOraclePrice();
     }
 
-    /****************************************
-     *          POSITION FUNCTIONS          *
-     ****************************************/
-
     /**
-     * @notice Creates a pair of long and short tokens equal in number to tokensToCreate. Pulls the required collateral.
-     * @param tokensToCreate number of long and short synthetic tokens to create.
+     * @notice Claim winnings after settlement
      */
-    function create(uint256 tokensToCreate) public requestInitialized nonReentrant {
-        require(treasury != address(0), "treasury not set");
-        uint256 fee = (tokensToCreate * feeBps) / 10000; // example: feeBps = 50 -> 0.5%
-        // Caller must approve this contract for tokensToCreate + fee
-        collateralToken.safeTransferFrom(msg.sender, address(this), tokensToCreate);
-        if (fee > 0) {
-            collateralToken.safeTransferFrom(msg.sender, treasury, fee);
-            emit FeeCollected(msg.sender, fee);
+    function claimWinnings() external whenNotPaused nonReentrant onlyAfterSettlement {
+        require(!claimed[msg.sender], "already claimed");
+        uint256 payout = 0;
+
+        // TIE: refund stakes (no change)
+        if (settlementPrice == 5e17) {
+            uint256 r1 = betsYes[msg.sender];
+            uint256 r2 = betsNo[msg.sender];
+            payout = r1 + r2;
+        } else if (settlementPrice == 1e18) {
+            // YES wins
+            uint256 userYes = betsYes[msg.sender];
+            require(userYes > 0, "no winning stake");
+            uint256 winningPool = totalYes;
+            uint256 losingPool = totalNo;
+
+            if (winningPool == 0) {
+                // no winners -> sweep losingPool to treasury
+                if (losingPool > 0) {
+                    collateralToken.safeTransfer(treasury, losingPool);
+                    emit TreasurySwept(losingPool);
+                    totalNo = 0;
+                }
+                payout = 0;
+            } else {
+                // payout = userYes * (totalYes + totalNo) / totalYes
+                uint256 totalPot = totalYes + totalNo;
+                payout = (userYes * totalPot) / winningPool;
+            }
+        } else { // settlementPrice == 0 => NO wins
+            uint256 userNo = betsNo[msg.sender];
+            require(userNo > 0, "no winning stake");
+            uint256 winningPool = totalNo;
+            uint256 losingPool = totalYes;
+
+            if (winningPool == 0) {
+                if (losingPool > 0) {
+                    collateralToken.safeTransfer(treasury, losingPool);
+                    emit TreasurySwept(losingPool);
+                    totalYes = 0;
+                }
+                payout = 0;
+            } else {
+                uint256 totalPot = totalYes + totalNo;
+                payout = (userNo * totalPot) / winningPool;
+            }
         }
 
-        require(longToken.mint(msg.sender, tokensToCreate));
-        require(shortToken.mint(msg.sender, tokensToCreate));
+        // mark claimed for both sides to prevent double claim
+        claimed[msg.sender] = true;
 
-        emit TokensCreated(msg.sender, tokensToCreate, tokensToCreate);
+        // clear user bets to save gas and avoid reclaims (optional)
+        betsYes[msg.sender] = 0;
+        betsNo[msg.sender] = 0;
+
+        if (payout > 0) {
+            collateralToken.safeTransfer(msg.sender, payout);
+            emit WinningsClaimed(msg.sender, payout);
+        } else {
+            emit WinningsClaimed(msg.sender, 0);
+        }
     }
 
-    /**
-     * @notice Redeems a pair of long and short tokens equal in number to tokensToRedeem.
-     * Returns the corresponding collateral amount in a 1 to 1 ratio.
-     * @param tokensToRedeem number of long and short synthetic tokens to redeem.
-     */
-    function redeem(uint256 tokensToRedeem) public {
-        require(longToken.burnFrom(msg.sender, tokensToRedeem));
-        require(shortToken.burnFrom(msg.sender, tokensToRedeem));
-
-        collateralToken.safeTransfer(msg.sender, tokensToRedeem);
-
-        emit TokensRedeemed(msg.sender, tokensToRedeem, tokensToRedeem);
-    }
-
-    /**
-     * @notice Settle long and/or short tokens in for collateral at a rate informed by the contract settlement.
-     * @param longTokensToRedeem number of long tokens to settle.
-     * @param shortTokensToRedeem number of short tokens to settle.
-     * @return collateralReturned total collateral returned in exchange for the pair of synthetics.
-     */
-    function settle(uint256 longTokensToRedeem, uint256 shortTokensToRedeem)
-        public
-        returns (uint256 collateralReturned)
-    {
-        require(receivedSettlementPrice, "price not yet resolved");
-
-        require(longToken.burnFrom(msg.sender, longTokensToRedeem));
-        require(shortToken.burnFrom(msg.sender, shortTokensToRedeem));
-
-        // settlementPrice is a number between 0 and 1e18. 0 means all collateral goes to short tokens and 1e18 means
-        // all collateral goes to the long token. Total collateral returned is the sum of payouts.
-        uint256 longCollateralRedeemed = (longTokensToRedeem * settlementPrice) / (1e18);
-        uint256 shortCollateralRedeemed = (shortTokensToRedeem * (1e18 - settlementPrice)) / (1e18);
-
-        collateralReturned = longCollateralRedeemed + shortCollateralRedeemed;
-        collateralToken.safeTransfer(msg.sender, collateralReturned);
-
-        emit PositionSettled(msg.sender, collateralReturned, longTokensToRedeem, shortTokensToRedeem);
-    }
-
-    /****************************************
-     *          INTERNAL FUNCTIONS          *
-     ****************************************/
-
-    /**
-     * @notice Request a price in the optimistic oracle for a given request timestamp and ancillary data combo. Set the bonds
-     * accordingly to the deployer's parameters. Will revert if re-requesting for a previously requested combo.
-     */
+    // --- Internal helpers for Optimistic Oracle interactions ---
     function _requestOraclePrice() internal {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
 
@@ -279,7 +301,6 @@ contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
             proposerReward
         );
 
-        // Set the Optimistic oracle liveness for the price request.
         optimisticOracle.setCustomLiveness(
             priceIdentifier,
             requestTimestamp,
@@ -287,39 +308,36 @@ contract EventBasedPredictionMarket is Testable, Ownable, ReentrancyGuard {
             optimisticOracleLivenessTime
         );
 
-        // Set the Optimistic oracle proposer bond for the price request.
         optimisticOracle.setBond(priceIdentifier, requestTimestamp, customAncillaryData, optimisticOracleProposerBond);
 
-        // Make the request an event-based request.
         optimisticOracle.setEventBased(priceIdentifier, requestTimestamp, customAncillaryData);
 
-        // Enable the priceDisputed and priceSettled callback
+        // priceDisputed = true, priceSettled = true, priceProposed = false
         optimisticOracle.setCallbacks(priceIdentifier, requestTimestamp, customAncillaryData, false, true, true);
 
         priceRequested = true;
+        emit PriceRequested(priceIdentifier, requestTimestamp);
     }
 
-    /**
-     * @notice Get the optimistic oracle.
-     * @return optimistic oracle instance.
-     */
     function getOptimisticOracle() internal view returns (OptimisticOracleV2Interface) {
-        return OptimisticOracleV2Interface(finder.getImplementationAddress("OptimisticOracleV2")); // TODO OracleInterfaces.OptimisticOracleV2
+        return OptimisticOracleV2Interface(finder.getImplementationAddress("OptimisticOracleV2"));
     }
 
-    /**
-     * @notice Get the identifier white list.
-     * @return identifier whitelist instance.
-     */
     function _getIdentifierWhitelist() internal view returns (IdentifierWhitelistInterface) {
         return IdentifierWhitelistInterface(finder.getImplementationAddress(OracleInterfaces.IdentifierWhitelist));
     }
 
-    /**
-     * @notice Get the address whitelist
-     * @return address whitelist instance.
-     */
     function _getAddressWhitelist() internal view returns (AddressWhitelist) {
         return AddressWhitelist(finder.getImplementationAddress(OracleInterfaces.CollateralWhitelist));
     }
+
+    // --- Emergency admin actions ---
+    /**
+     * @notice Owner can sweep stuck ERC20 collateral (careful).
+     */
+    function sweepToken(address token, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "zero dest");
+        IERC20(token).transfer(to, amount);
+    }
 }
+
