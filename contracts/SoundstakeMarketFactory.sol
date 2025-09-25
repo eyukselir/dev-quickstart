@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.17;
 
-import "./SoundStakePredictionMarket.sol";
+import "./EventBasedPredictionMarket.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract MarketFactory is Ownable {
