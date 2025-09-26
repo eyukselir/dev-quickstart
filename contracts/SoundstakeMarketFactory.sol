@@ -1,51 +1,71 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.17;
 
-import "./EventBasedPredictionMarket.sol";
+import "@openzeppelin/contracts/proxy/Clones.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract MarketFactory is Ownable {
+interface ISoundStakePredictionMarketClone {
+    function initialize(
+        string memory _pairName,
+        address _collateralToken,
+        bytes memory _customAncillaryData,
+        address _finder,
+        address _owner,
+        bytes32 _priceIdentifier,
+        uint256 _proposerReward
+    ) external;
+}
+
+contract MarketFactoryClones is Ownable {
+    using Clones for address;
+
+    address public implementation; // address of the master contract
     address[] public markets;
 
-    event MarketCreated(
-        address indexed market,
-        address indexed creator,
-        string pairName
-    );
+    event MarketCreated(address indexed market, address indexed creator, string pairName);
 
-    /**
-     * @notice Create a new SoundStakePredictionMarket
-     * @param _pairName readable name for market
-     * @param _collateralToken address of collateral ERC20
-     * @param _customAncillaryData the UMA question bytes
-     * @param _finder UMA Finder contract on that network
-     * @param _timerAddress usually address(0) in production
-     */
+    constructor(address _implementation) {
+        implementation = _implementation;
+    }
+
+    function setImplementation(address _imp) external onlyOwner {
+        implementation = _imp;
+    }
+
     function createMarket(
         string calldata _pairName,
         address _collateralToken,
         bytes calldata _customAncillaryData,
         address _finder,
-        address _timerAddress
+        bytes32 _priceIdentifier,
+        uint256 _proposerReward
     ) external returns (address) {
-        SoundStakePredictionMarket m = new SoundStakePredictionMarket(
+        address clone = implementation.clone(); // non-deterministic
+        // initialize the clone
+        ISoundStakePredictionMarketClone(clone).initialize(
             _pairName,
-            ExpandedERC20(_collateralToken),
+            _collateralToken,
             _customAncillaryData,
-            FinderInterface(_finder),
-            _timerAddress
+            _finder,
+            msg.sender,           // owner of the clone = caller
+            _priceIdentifier,
+            _proposerReward
         );
 
-        // Ownership çağırana devrediliyor (opsiyonel)
-        m.transferOwnership(msg.sender);
+        markets.push(clone);
+        emit MarketCreated(clone, msg.sender, _pairName);
+        return clone;
+    }
 
-        markets.push(address(m));
-        emit MarketCreated(address(m), msg.sender, _pairName);
-        return address(m);
+    // Optionally: deterministic clone via CREATE2
+    function createMarketDeterministic(/* include salt param */) external returns (address) {
+        // use implementation.cloneDeterministic(salt)
+        // then initialize
     }
 
     function getMarkets() external view returns (address[] memory) {
         return markets;
     }
 }
+
 
