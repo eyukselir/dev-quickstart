@@ -11,8 +11,9 @@ import "@uma/core/contracts/oracle/interfaces/IdentifierWhitelistInterface.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
-contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausable {
+contract SoundStakePredictionMarket is Initializable,Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for ExpandedERC20;
 
     // --- Oracle / market state ---
@@ -20,7 +21,7 @@ contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausa
     bool public receivedSettlementPrice;
     uint256 public requestTimestamp;
     string public pairName;
-
+    address private _timerAddress;
     // settlementPrice encoding: 0 => NO, 0.5e18 => TIE, 1e18 => YES
     uint256 public settlementPrice;
     bytes32 public priceIdentifier = "YES_OR_NO_QUERY";
@@ -72,21 +73,37 @@ contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausa
         _;
     }
 
-    constructor(
+   
+
+    // initializer — set what constructor previously set + owner
+    function initialize(
         string memory _pairName,
-        ExpandedERC20 _collateralToken,
+        address _collateralToken,
         bytes memory _customAncillaryData,
-        FinderInterface _finder,
-        address _timerAddress
-    ) Testable(_timerAddress) {
-        finder = _finder;
+        address _finder,
+        address _owner,
+        bytes32 _priceIdentifier,
+        uint256 _proposerReward
+    ) external initializer {
 
-        require(_getIdentifierWhitelist().isIdentifierSupported(priceIdentifier), "Identifier not registered");
-        require(_getAddressWhitelist().isOnWhitelist(address(_collateralToken)), "Unsupported collateral type");
+    
 
+        // set state
         pairName = _pairName;
-        collateralToken = _collateralToken;
+        collateralToken = ExpandedERC20(_collateralToken);
         customAncillaryData = _customAncillaryData;
+        finder = FinderInterface(_finder);
+        priceIdentifier = _priceIdentifier;
+        proposerReward = _proposerReward;
+        
+        // default params (owner can change later)
+        optimisticOracleLivenessTime = 3600;
+        optimisticOracleProposerBond = 500e18;
+        feeBps = 0;
+        treasury = address(0);
+
+        // transfer ownership to provided owner
+        _transferOwnership(_owner);
     }
 
     // --- Admin setters ---
@@ -99,7 +116,11 @@ contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausa
         require(_treasury != address(0), "zero treasury");
         treasury = _treasury;
     }
-
+function getCurrentTime() public view returns (uint256) {
+    
+        return block.timestamp;
+    
+}
     function setProposerReward(uint256 _r) external onlyOwner {
         proposerReward = _r;
     }
@@ -340,4 +361,5 @@ contract SoundStakePredictionMarket is Testable, Ownable, ReentrancyGuard, Pausa
         IERC20(token).transfer(to, amount);
     }
 }
+
 
